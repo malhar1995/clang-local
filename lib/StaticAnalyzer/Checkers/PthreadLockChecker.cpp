@@ -18,6 +18,7 @@
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include <iostream>
 
 using namespace clang;
 using namespace ento;
@@ -25,7 +26,7 @@ using namespace ento;
 namespace {
 
 struct LockState {
-  enum Kind { Destroyed, Locked, Unlocked } K;
+  enum Kind { Destroyed, Locked, Unlocked, SchrodingerLocked, SchrodingerUnlocked } K;
 
 private:
   LockState(Kind K) : K(K) {}
@@ -34,6 +35,8 @@ public:
   static LockState getLocked() { return LockState(Locked); }
   static LockState getUnlocked() { return LockState(Unlocked); }
   static LockState getDestroyed() { return LockState(Destroyed); }
+  static LockState getSchrodingerLocked() { return LockState(SchrodingerLocked); }
+  static LockState getSchrodingerUnlocked() { return LockState(SchrodingerUnlocked); }
 
   bool operator==(const LockState &X) const {
     return K == X.K;
@@ -42,13 +45,15 @@ public:
   bool isLocked() const { return K == Locked; }
   bool isUnlocked() const { return K == Unlocked; }
   bool isDestroyed() const { return K == Destroyed; }
+  bool isSchrodingerLocked() const { return K == SchrodingerLocked; }
+  bool isSchrodingerUnlocked() const { return K == SchrodingerUnlocked; }
 
   void Profile(llvm::FoldingSetNodeID &ID) const {
     ID.AddInteger(K);
   }
 };
 
-class PthreadLockChecker : public Checker< check::PostStmt<CallExpr> > {
+class PthreadLockChecker : public Checker< check::PostStmt<CallExpr>, check::DeadSymbols > {
   mutable std::unique_ptr<BugType> BT_doublelock;
   mutable std::unique_ptr<BugType> BT_doubleunlock;
   mutable std::unique_ptr<BugType> BT_destroylock;
@@ -61,6 +66,7 @@ class PthreadLockChecker : public Checker< check::PostStmt<CallExpr> > {
   };
 public:
   void checkPostStmt(const CallExpr *CE, CheckerContext &C) const;
+  void checkDeadSymbols(SymbolReaper &SymReaper, CheckerContext &C) const;
 
   void AcquireLock(CheckerContext &C, const CallExpr *CE, SVal lock,
                    bool isTryLock, enum LockingSemantics semantics) const;
@@ -76,6 +82,7 @@ public:
 REGISTER_LIST_WITH_PROGRAMSTATE(LockSet, const MemRegion *)
 
 REGISTER_MAP_WITH_PROGRAMSTATE(LockMap, const MemRegion *, LockState)
+REGISTER_MAP_WITH_PROGRAMSTATE(DestroyRetVal, const MemRegion *, SymbolRef)
 
 void PthreadLockChecker::checkPostStmt(const CallExpr *CE,
                                        CheckerContext &C) const {
@@ -126,9 +133,29 @@ void PthreadLockChecker::AcquireLock(CheckerContext &C, const CallExpr *CE,
 
   const MemRegion *lockR = lock.getAsRegion();
   if (!lockR)
-    return;
+    return; 
 
   ProgramStateRef state = C.getState();
+
+  // CHECK THIS
+  const SymbolRef* sym = state->get<DestroyRetVal>(lockR);
+  if(sym){
+    const LockState* lstate = state->get<LockMap>(lockR);
+    if(lstate){
+      ConstraintManager &CMgr = state->getConstraintManager();
+      ConditionTruthVal retZero = CMgr.isNull(state, *sym);
+      if(retZero.isConstrainedFalse()){
+        if(lstate->isSchrodingerLocked())
+          state = state->set<LockMap>(lockR, LockState::getLocked());
+        else if(lstate->isSchrodingerUnlocked())
+          state = state->set<LockMap>(lockR, LockState::getUnlocked());
+      }
+      else{
+        if(!lstate || lstate->isSchrodingerLocked() || lstate->isSchrodingerUnlocked())
+          state = state->set<LockMap>(lockR, LockState::getDestroyed());
+      }
+    }
+  }
 
   SVal X = state->getSVal(CE, C.getLocationContext());
   if (X.isUnknownOrUndef())
@@ -198,6 +225,26 @@ void PthreadLockChecker::ReleaseLock(CheckerContext &C, const CallExpr *CE,
 
   ProgramStateRef state = C.getState();
 
+  // CHECK THIS
+  const SymbolRef* sym = state->get<DestroyRetVal>(lockR);
+  if(sym){
+    const LockState* lstate = state->get<LockMap>(lockR);
+    if(lstate){
+      ConstraintManager &CMgr = state->getConstraintManager();
+      ConditionTruthVal retZero = CMgr.isNull(state, *sym);
+      if(retZero.isConstrainedFalse()){
+        if(lstate->isSchrodingerLocked())
+          state = state->set<LockMap>(lockR, LockState::getLocked());
+        else if(lstate->isSchrodingerUnlocked())
+          state = state->set<LockMap>(lockR, LockState::getUnlocked());
+      }
+      else{
+        if(!lstate || lstate->isSchrodingerLocked() || lstate->isSchrodingerUnlocked())
+          state = state->set<LockMap>(lockR, LockState::getDestroyed());
+      }
+    }
+  }
+
   if (const LockState *LState = state->get<LockMap>(lockR)) {
     if (LState->isUnlocked()) {
       if (!BT_doubleunlock)
@@ -253,9 +300,50 @@ void PthreadLockChecker::DestroyLock(CheckerContext &C, const CallExpr *CE,
 
   ProgramStateRef State = C.getState();
 
+  // CHECK THIS
+  const SymbolRef* sym = State->get<DestroyRetVal>(LockR);
+  if(sym){
+    const LockState* lstate = State->get<LockMap>(LockR);
+    if(lstate){
+      ConstraintManager &CMgr = State->getConstraintManager();
+      ConditionTruthVal retZero = CMgr.isNull(State, *sym);
+      if(retZero.isConstrainedFalse()){
+        if(lstate->isSchrodingerLocked())
+          State = State->set<LockMap>(LockR, LockState::getLocked());
+        else if(lstate->isSchrodingerUnlocked())
+          State = State->set<LockMap>(LockR, LockState::getUnlocked());
+      }
+      else{
+        if(!lstate || lstate->isSchrodingerLocked() || lstate->isSchrodingerUnlocked())
+          State = State->set<LockMap>(LockR, LockState::getDestroyed());
+      }
+    }
+  }
+
+  // CHECK THIS
   const LockState *LState = State->get<LockMap>(LockR);
-  if (!LState || LState->isUnlocked()) {
-    State = State->set<LockMap>(LockR, LockState::getDestroyed());
+  if(!LState){
+    SVal X = State->getSVal(CE, C.getLocationContext());
+    if (X.isUnknownOrUndef()){
+      return;
+    }
+
+    DefinedSVal retVal = X.castAs<DefinedSVal>();
+    retVal.dump();
+    SymbolRef sym = retVal.getAsSymbol();
+    State = State->set<DestroyRetVal>(LockR, sym);
+    C.addTransition(State);
+    return;
+  }
+  if (LState->isUnlocked()) {
+    SVal X = State->getSVal(CE, C.getLocationContext());
+    if (X.isUnknownOrUndef())
+      return;
+
+    DefinedSVal retVal = X.castAs<DefinedSVal>();
+    SymbolRef sym = retVal.getAsSymbol();
+    State = State->set<DestroyRetVal>(LockR, sym);
+    State = State->set<LockMap>(LockR, LockState::getSchrodingerUnlocked());
     C.addTransition(State);
     return;
   }
@@ -326,6 +414,37 @@ void PthreadLockChecker::reportUseDestroyedBug(CheckerContext &C,
       *BT_destroylock, "This lock has already been destroyed", N);
   Report->addRange(CE->getArg(0)->getSourceRange());
   C.emitReport(std::move(Report));
+}
+void PthreadLockChecker::checkDeadSymbols(SymbolReaper &SymReaper,
+                                           CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  ConstraintManager &CMgr = State->getConstraintManager();
+
+  DestroyRetValTy TrackedSymbols = State->get<DestroyRetVal>();
+  for (DestroyRetValTy::iterator I = TrackedSymbols.begin(),
+                             E = TrackedSymbols.end(); I != E; ++I) {
+    SymbolRef Sym = I->second;
+    const MemRegion* lockR = I->first;
+    bool IsSymDead = SymReaper.isDead(Sym);
+    const LockState* LState = State->get<LockMap>(lockR); 
+    // Remove the dead symbol from the return value symbols map.
+    if (IsSymDead){
+      ConditionTruthVal retZero = CMgr.isNull(State, Sym);
+      if(retZero.isConstrainedFalse()){
+        if(LState && LState->isSchrodingerLocked())
+          State = State->set<LockMap>(lockR, LockState::getLocked());
+        else if(LState && LState->isSchrodingerUnlocked())
+          State = State->set<LockMap>(lockR, LockState::getUnlocked());
+      }
+      else{
+        // IS THIS CORRECT?
+        if(!LState || LState->isSchrodingerUnlocked() || LState->isSchrodingerLocked())
+          State = State->set<LockMap>(lockR, LockState::getDestroyed());
+      }
+      State = State->remove<DestroyRetVal>(lockR);
+    }
+  }
+  C.addTransition(State);
 }
 
 void ento::registerPthreadLockChecker(CheckerManager &mgr) {
